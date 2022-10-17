@@ -1,0 +1,771 @@
+## Pipeline
+
+![](images/Screen%20Shot%202022-09-21%20at%204.49.09%20AM.png)
+
+## Import libraries and sources
+
+```{r}
+suppressPackageStartupMessages({
+  library(shiny)
+  library(shinyjs)
+  library(dplyr)
+  library(table1)
+  library(MatchIt)
+  library(lmtest)
+  library(sandwich)
+  library(ggplot2)
+  library(cowplot)
+  library(reticulate)
+  library(data.table)
+  library(bs4Dash)
+  library(rdist)
+  library(tibble)
+  library(DT)
+  library(crayon)
+  library(ipfr)
+  library(rlang)
+  library(formattable)
+})
+
+source("../App/Modules/p_val_add.R")
+```
+
+## Helper Functions
+
+Function 1: Calculate ATT between two populations.
+
+```{r}
+get_ATT <- function(Tr, Cn){
+  merged <- rbind(Tr %>% select(MASKID:SEATSYS), Cn%>% select(MASKID:SEATSYS))
+  m.out <- matchit(RANDASSIGN ~ SUB_SENIOR + SUB_CKD + CVDHISTORY + 
+                     RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE + 
+                     CIGSMOKER + CVDPOINTS, data = merged, 
+                     method = "nearest", distance = "glm")
+  matched_data <- match.data(m.out) 
+  fit <- lm(SEATSYS ~ RANDASSIGN + SUB_SENIOR + SUB_CKD + 
+               CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+             + CIGSMOKER + CVDPOINTS, data = matched_data, weights = weights)
+  ATT <- coeftest(fit, vcov. = vcovCL, cluster = ~subclass)["RANDASSIGN",,drop = FALSE][1]
+  return (ATT) 
+}
+```
+
+Function 2: Calculate Log Disparity between two populations for the equity variables - Age, Gender and Race.
+
+```{r}
+ev_list <- c("RZ_AGE", "GENDER", "RACE_")
+ev_level_list <- list(list(0,1,2,3), list(1,2), list(0,1,2,3))
+get_LDM_from_pop <- function(trialPopulation, targetPopulation) {
+  ev_counter <- 1
+  df_colnames <- c("VAR", "Level", "Trial_Grp", "Trial_Non_Grp", 
+                   "Target_Grp", "Target_Non_Grp", "LDM")
+  ldm_df <- data.frame(matrix(ncol=7,nrow=0, dimnames=list(NULL, df_colnames)))
+  for (ev in ev_list){
+    ev_levels <- ev_level_list[ev_counter]
+    for (level in unlist(ev_levels)){
+      trial_grp_mmbr <- trialPopulation %>% filter((!!sym(ev))==level) %>% count()
+      trial_non_grp_mmbr <- trialPopulation %>% filter((!!sym(ev))!=level) %>% count()
+      target_grp_mmbr <- targetPopulation %>% filter((!!sym(ev))==level) %>% count()
+      target_non_grp_mmbr <- targetPopulation %>% filter((!!sym(ev))!=level) %>% count()
+
+      ldm <- log(trial_grp_mmbr/trial_non_grp_mmbr) - log(target_grp_mmbr/target_non_grp_mmbr)
+      ldm_df[nrow(ldm_df)+1, ] <- c(ev, level, trial_grp_mmbr, trial_non_grp_mmbr,
+                                    target_grp_mmbr, target_non_grp_mmbr, ldm)
+    }
+    ev_counter <- ev_counter + 1
+  }
+  return (ldm_df)
+}
+```
+
+Function 3: Calculate LDM using just Count values from Target (like NHANES)
+
+```{r}
+# ev_list <- c("RZ_AGE", "GENDER", "RACE_")
+# ev_level_list <- list(list(0,1,2,3), list(1,2), list(0,1,2,3,4))
+# ev_counts_list <- list(list(3979,2226,1865,1901), list(5079,4892),
+#                        list(505,1042,2129,3066, 3229))
+
+ev_list <- c("GENDER", "RACE_")
+ev_level_list <- list(list(1,2), list(0,1,2,3,4))
+ev_counts_list <- list(list(5079,4892),
+                       list(505,1042,2129,3066, 3229))
+
+get_LDM_from_summary <- function(trialPopulation) {
+  ev_counter <- 1
+  df_colnames <- c("VAR", "Level", "Trial_Grp", "Trial_Non_Grp", 
+                   "Target_Grp", "Target_Non_Grp", "LDM")
+  ldm_df <- data.frame(matrix(ncol=7,nrow=0, dimnames=list(NULL, df_colnames)))
+  for (ev in ev_list){
+    ev_levels <- unlist(ev_level_list[ev_counter])
+    ev_counts <- unlist(ev_counts_list[ev_counter])
+    for (i in 1:length(ev_levels)){ #level in unlist(ev_levels)
+      level <- ev_levels[i]
+      trial_grp_mmbr <- trialPopulation %>% filter((!!sym(ev))==level) %>% count()
+      trial_non_grp_mmbr <- trialPopulation %>% filter((!!sym(ev))!=level) %>% count()
+      target_grp_mmbr <- ev_counts[i]
+      target_non_grp_mmbr <- sum(ev_counts) - target_grp_mmbr
+
+      ldm <- log(trial_grp_mmbr/trial_non_grp_mmbr) - log(target_grp_mmbr/target_non_grp_mmbr)
+      ldm_df[nrow(ldm_df)+1, ] <- c(ev, level, trial_grp_mmbr, trial_non_grp_mmbr,
+                                    target_grp_mmbr, target_non_grp_mmbr, ldm)
+    }
+    ev_counter <- ev_counter + 1
+  }
+  return (ldm_df)
+}
+```
+
+## Load Data
+
+Lets start with **Loading** the data into the program first. We're using the outcome data (SEATSYS) of 18 months after the index date. Covariate values are baseline. We merge some of the RACE categories and age groups here. We also remove any data with NA values.
+
+```{r}
+#data <- read.csv("../Data/XTY/18M_seatsys.csv")
+nhanes <- read.csv("../../nhanes_15_16.csv")
+data <- read.csv("../../18M_seatsys2.csv")
+data <- na.omit(data)
+
+#change hierarchy of Races (Asian, Black, White, Others):(0,1,2,3)
+# data$RACE_[is.element(data$RACE_, c(2,3,4,5,6))] = 3
+# data$RACE_[data$RACE_==7] = 2
+data$RACE_ <- data$RACE
+
+#0-> <18, 1-> 18-39, 2-> 40-59, 3-> 59+
+data <- data %>% mutate(data, RZ_AGE = ifelse(RZ_AGE<18, 0, ifelse(RZ_AGE<40, 1, 
+                                                                       ifelse(RZ_AGE<60, 2, 3))))
+
+head(data)
+```
+
+Let's look at **Table 1** style data before doing anything to get an idea what the whole population looks like.
+
+```{r}
+
+#copy into another dataframe to show in table 1
+dat <- data
+
+#convert treatment variable to characters from Integer
+dat$RANDASSIGN <- as.character(dat$RANDASSIGN)
+
+#other necessary changes
+dat$RANDASSIGN <- factor(dat$RANDASSIGN, levels=0:1, labels = c("Controls", "Treated"))
+dat$RZ_AGE <- factor(dat$RZ_AGE, levels = 0:3, labels=c("<18", '18-39', '40-59', '59+'))
+dat$SUB_SENIOR <- as.logical((dat$SUB_SENIOR))
+dat$SUB_CKD <- as.logical((dat$SUB_CKD)) 
+dat$CVDHISTORY <- as.logical((dat$CVDHISTORY))
+dat$GENDER <- factor(dat$GENDER, levels=1:2, labels=c("Female", "Male"))
+dat$RACE_ <- factor(dat$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+dat$CIGSMOKER <- as.logical(dat$CIGSMOKER)
+
+#labels
+label(dat$SUB_SENIOR) <- "In Senior Subgroup (baseline age >=75)"
+label(dat$SUB_CKD) <- "In CKD Subgroup (baseline eGFR<60)"
+label(dat$CVDHISTORY) <- "Has Clinical or Subclinical CVD at Baseline"
+label(dat$RZ_AGE) <- "Participant Age Group"
+label(dat$GENDER) <- "Participant Gender"
+label(dat$RACE_) <- "Participant Race"
+label(dat$SERUMCREAT) <- "Labs: Serum Creatinine mg/dL (within past 6 months)"
+label(dat$GFRESTIMATE) <- "Estimated GFR within past 6 months at Baseline"
+label(dat$CIGSMOKER) <- "Current cigarette smoker (at baseline)?"
+label(dat$CVDPOINTS) <- "Framingham Risk Score at Baseline"
+label(dat$SEATSYS) <- "Systolic Blood Pressure at Baseline"
+
+#plot table
+x<- table1(~ SUB_SENIOR + SUB_CKD + 
+             CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+           + CIGSMOKER + CVDPOINTS + SEATSYS | RANDASSIGN, data = dat)
+
+x
+```
+
+Let's assume that our **equity variables** will be Race, and Gender. So let's look at just these two variables' distribution for the overall population.
+
+```{r}
+#plot table
+equity_target <- table1(~ GENDER + RACE_ | RANDASSIGN, data = dat)
+equity_target
+```
+
+Now let's look at NHANES table 1 data for the equity variables.
+
+```{r}
+nhanes_copy <- nhanes 
+nhanes_copy$GENDER <- factor(nhanes_copy$GENDER, levels=1:2, labels=c("Female", "Male"))
+nhanes_copy$RACE <- factor(nhanes_copy$RACE, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+label(nhanes_copy$GENDER) <- "Participant Gender"
+label(nhanes_copy$RACE) <- "Participant Race"
+
+table1(~ GENDER + RACE, data = nhanes_copy)
+```
+
+## Step 0: Split the sites into [Trial]{.underline} and [External]{.underline} Sources
+
+Let's split the sites into **Trial** and **External** sources. Trial sources will be any site with [***MORE than 100 patients (will switch this in a separate notebook and experiment)***]{.underline} Combining all samples from these Trial Sources will be the final Trial Population. And the rest of the population from all the External Sources will be the External Population.
+
+```{r}
+
+input_threshold <- 100
+
+counts <- aggregate(x = data$MASKID, by = list(data$NEWSITEID),
+                      FUN = function(x) length(unique(x)))
+
+#applying thresholds
+site_counts <- counts[order(-counts$x), ]
+th_sites <- site_counts[site_counts$x <= input_threshold, ]
+sca_sites <- site_counts[site_counts$x > input_threshold, ]
+
+#slicing sites by IDs
+th_data <- data[is.element(data$NEWSITEID, th_sites$Group.1), ]
+sca_data <- data[is.element(data$NEWSITEID, sca_sites$Group.1), ]
+
+#source finalize
+TA <- th_data[th_data$RANDASSIGN == 1, ]
+CC <- th_data[th_data$RANDASSIGN == 0, ]
+EC <- sca_data[sca_data$RANDASSIGN == 0, ]
+```
+
+Now let's take a look at the distributions of TA, CC and EC before any matching and other processing. Let's make sure our TA, CC and EC have different distributions than TP in Age, Gender and Race.
+
+```{r warning=FALSE}
+TA_copy <- TA
+CC_copy <- CC
+EC_copy <- EC
+nhanes_copy <- nhanes 
+
+TA_copy$DIV <- 1
+CC_copy$DIV <- 2
+EC_copy$DIV <- 3
+nhanes_copy$DIV <- 4
+
+dat <- do.call("rbind", list(TA_copy, CC_copy, EC_copy))
+
+population_labels = c("Treated(TA)", "Trial Controls(CC)", "External Controls(EC)")
+      
+# DIV_MAP = data.frame(groupname=population_labels,
+#                      divvalue=c(1,2,3))
+# 
+# all_controls <- gen_p_val_controls(dat, DIV_MAP)
+
+#variable category declaration
+dat$DIV <- factor(dat$DIV, levels=1:3, 
+                  labels = population_labels)
+dat$RZ_AGE <- factor(dat$RZ_AGE, levels = 0:3, labels=c("<18", '18-39', '40-59', '59+'))
+dat$SUB_SENIOR <- as.logical((dat$SUB_SENIOR))
+dat$SUB_CKD <- as.logical((dat$SUB_CKD)) 
+dat$CVDHISTORY <- as.logical((dat$CVDHISTORY))
+dat$GENDER <- factor(dat$GENDER, levels=1:2, labels=c("Female", "Male"))
+dat$RACE_ <- factor(dat$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+dat$CIGSMOKER <- as.logical(dat$CIGSMOKER)
+
+#labels
+label(dat$SUB_SENIOR) <- "In Senior Subgroup (baseline age >=75)"
+label(dat$SUB_CKD) <- "In CKD Subgroup (baseline eGFR<60)"
+label(dat$CVDHISTORY) <- "Has Clinical or Subclinical CVD at Baseline"
+label(dat$RZ_AGE) <- "Participant Age Group"
+label(dat$GENDER) <- "Participant Gender"
+label(dat$RACE_) <- "Participant Race"
+label(dat$SERUMCREAT) <- "Labs: Serum Creatinine mg/dL (within past 6 months)"
+label(dat$GFRESTIMATE) <- "Estimated GFR within past 6 months at Baseline"
+label(dat$CIGSMOKER) <- "Current cigarette smoker (at baseline)?"
+label(dat$CVDPOINTS) <- "Framingham Risk Score at Baseline"
+label(dat$SEATSYS) <- "Systolic Blood Pressure at Baseline"
+
+#plot table
+x<- table1(~ SUB_SENIOR + SUB_CKD + 
+             CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+           + CIGSMOKER + CVDPOINTS + SEATSYS | DIV, data = dat, overall = F)
+
+# x<- as.data.frame(x)
+#       
+# for (controls in population_labels[2:length(population_labels)]){
+#   x[[controls]] <- all_controls[[controls]]
+# }
+
+x
+
+```
+
+Now finally, let's look at Table 1 data of TA, CC and EC against NHANES for the equity variables.
+
+```{r}
+dat <- do.call("rbind", list(TA_copy %>% select(RACE_, GENDER, DIV), 
+                             CC_copy %>% select(RACE_, GENDER, DIV), 
+                             EC_copy %>% select(RACE_, GENDER, DIV), 
+                             nhanes_copy %>% select(RACE, GENDER, DIV) %>% 
+                               rename(RACE_ = RACE)))
+
+population_labels = c("Treated(TA)", "Trial Controls(CC)", "External Controls(EC)", "NHANES")
+
+#variable category declaration
+dat$DIV <- factor(dat$DIV, levels=1:4, 
+                  labels = population_labels)
+dat$GENDER <- factor(dat$GENDER, levels=1:2, labels=c("Female", "Male"))
+dat$RACE_ <- factor(dat$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+
+#labels
+label(dat$GENDER) <- "Participant Gender"
+label(dat$RACE_) <- "Participant Race"
+
+#plot table
+x<- table1(~ GENDER + RACE_ | DIV, data = dat, overall = F)
+x
+```
+
+### Introducing LDM
+
+Log Disparity Metric (LDM) -
+
+$$
+LDM = \begin{equation} log(odds(g(x)=1|y\prime = 1)) - log(odds(g(x)=1|y = 1)) \end{equation} 
+$$
+
+Here
+
+-   $y\prime=1$ represents member of trial population, and $y=1$ represents member of target population.
+
+-   Let $\mathcal{G}$ be a group of indicator function for subgroup membership and for each $g\in \mathcal{G}$ , $g(x)=1$ means that an individual with protected attribute $x$ is in the subgroup.
+
+-   So $g(x)=1$ represents belonging to a particular subgroup. For example, if we have a subgroup "**white female"** then $g(x)=1$ represents that a sample with covariate $x$ belongs to white-female subgroup, and $g(x)=0$ represents the opposite.
+
+-   We know, for any event $x$,
+
+    $$
+    Odds(x) = \frac{Pr(x)}{1-Pr(x)}
+    $$
+
+So, in plain words, the LDM can be presented as -
+
+$$
+LDM = log \left[ \frac{\text{Num of Trial People in desired subgroup g(.)}}{ \text{Num of Trial People NOT in desired subgroup g(.)}} \right] - \\ log \left[ \frac{\text{Num of Target People in desired subgroup g(.)}}{ \text{Num of Target People NOT in desired subgroup g(.)}} \right]
+$$
+
+LDM is univariate, must be measured for each protected covariate.
+
+## Step 1: Equity Measure of TA, CC and EC against TP
+
+Now, Let's also look at the equity of features between {TA, CC, EC} and TP.
+
+```{r}
+TA_equity <- get_LDM_from_summary(TA)
+CC_equity <- get_LDM_from_summary(CC)
+EC_equity <- get_LDM_from_summary(EC)
+
+merged_LDM <- do.call("cbind", list(
+  TA_equity %>% select(VAR, Level, LDM) %>% rename(LDM_TA = LDM),
+  CC_equity %>% select(LDM) %>% rename(LDM_CC = LDM), 
+  EC_equity %>% select(LDM) %>% rename(LDM_EC = LDM)))
+ 
+SUBGROUP = c("Female", "Male", "Others", "NH Asian", "NH Black", "NH White", "Hispanic")
+merged_LDM_original <- add_column(merged_LDM, SUBGROUP, .after = 2)
+```
+
+Here, LDM = 0 means perfect equity. Let's introduce two thresholds (from Miao's Paper): $\mathcal{T}_{lower} = -log(0.8) = 0.2231436$ and $\mathcal{T}_{upper} = -log(0.6) = 0.5108256$.
+
+$$ LDM  
+\begin{cases}       
+   = 0, & \text{Perfect Equity} \\
+   = x, \text{ such that} -\mathcal{T}_{lower} < x< \mathcal{T}_{lower} & \text{Equitable Representation} \\ 
+   = x, \text{ such that}-\mathcal{T}_{upper} < x < -\mathcal{T}_{lower} & \text{Potential Underrepresentation} \\
+   = x, \text{ such that } \mathcal{T}_{lower} < x < \mathcal{T}_{upper} & \text{Potential Overrepresentation} \\
+   = x, \text{ such that } x< -\mathcal{T}_{upper} & \text{High Underrepresentation} \\
+   = x, \text{ such that } x > \mathcal{T}_{upper} & \text{High Overrepresentation} \\
+\end{cases}
+$$
+
+```{r}
+formattable(merged_LDM_original,
+            align = c("l", "c", "c","c","c"))
+```
+
+-   In the above table, VAR column represents the equity variable.
+
+-   GENDER level 1,2 means Female and Male respectively.
+
+-   RACE\_ level 0,1,2,3,4 means - Others, NH Asian, NH Black, NH White, Hispanic respectively.
+
+-   LDM_TA, LDM_CC and LDM_EC columns present Log Disparity values for TA vs TP, CC vs TP and EC vs TP respectively. [**Here TP is the NHANES population.**]{.underline}
+
+## Step 2: Generate IPF Weights for TA $$W_{TA\_ipf}$$
+
+Generate IPF weights for matching TA with Target Population distribution. Let's call it $$W_{TA\_ipf}$$ .
+
+We will use $$W_{TA\_init}$$ = 1 as initial weights for IPF to work.
+
+```{r}
+
+#fix the target distributions from TP
+targets <- list()
+# targets$RZ_AGE <- tibble(
+#   '0' = 0.0,
+#   '1' = 0.0,
+#   '2' = 18.7,
+#   '3' = 19.1
+# )
+targets$GENDER <- tibble(
+  '1' = 50.9,
+  '2' = 49.1
+)
+targets$RACE_ <- tibble(
+  '0' = 5.1,
+  '1' = 10.5,
+  '2' = 21.4,
+  '3' = 30.7,
+  '4' = 32.4
+)
+
+#var_list <- c("RZ_AGE", "GENDER", "RACE_")
+var_list <- c("GENDER", "RACE_")
+dat <- TA
+dat$weight <- 1 #setting initial W_TA_init = 1 for all TA samples 
+dat2 <- dat %>% select(unlist(var_list), weight)
+dat2 <- as_tibble(dat2)
+result <- ipu(dat2, targets, max_iterations = 5000)
+W_TA_ipf <- result$weight_tbl$weight
+```
+
+Let's check if the weights that we got from IPF for TA really generates samples with similar distribution to TP. Checked for multiple seeds.
+
+```{r}
+#check sampled data distribution for equity variables 
+set.seed(42)
+sampled_data <- dat[sample(seq_len(nrow(dat)), replace = TRUE, 1975, prob = W_TA_ipf),]
+drop_column <- c("weight")
+sampled_data <- sampled_data[, !(names(sampled_data) %in% drop_column)]
+
+sampled_data$DIV <- 2
+nhanes_copy <- nhanes
+nhanes_copy$DIV <- 3
+
+merged_TA <- do.call("rbind", list(TA_copy %>% select(RACE_, GENDER, DIV), 
+                                   sampled_data %>% select(RACE_, GENDER, DIV), 
+                                   nhanes_copy %>% select(RACE, GENDER, DIV) %>% 
+                                     rename(RACE_ = RACE)))
+
+merged_TA$DIV <- factor(merged_TA$DIV, levels=1:3, 
+                  labels = c("Original TA", "IPF TA Sample", "NHANES"))
+
+merged_TA$GENDER <- factor(merged_TA$GENDER, levels=1:2, labels=c("Female", "Male"))
+merged_TA$RACE_ <- factor(merged_TA$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+
+x <- table1(~ GENDER + RACE_ | DIV , data = merged_TA, overall = F)
+x
+```
+
+## Step (Optional) : Bias CC
+
+Now let's deliberately bias the Control Arm CC. Let's keep it simple at the beginning. Let's [**remove**]{.underline} subgroups of
+
+-   NH White Female population who fall in the age group of 59+
+
+-   NH Black Male population
+
+Note: Will Introduce IPF Later in this place.
+
+```{r}
+Biased_CC <- CC %>% filter(!(RACE_ == 3 & GENDER == 1 & RZ_AGE == 3)) %>%
+                    filter(!(RACE_ == 2 & GENDER == 2 )) #& RZ_AGE == 3
+Biased_CC$DIV = 1
+
+nhanes_copy <- nhanes
+nhanes_copy$DIV <- 2
+
+merged_CC <- do.call("rbind", list(Biased_CC %>% select(RACE_, GENDER, DIV), 
+                                   nhanes_copy %>% select(RACE, GENDER, DIV) %>% 
+                                     rename(RACE_ = RACE)))
+
+merged_CC$DIV <- factor(merged_CC$DIV, levels = c(1,2), labels=c("Biased Controls", "NHANES"))
+
+merged_CC$GENDER <- factor(merged_CC$GENDER, levels=1:2, labels=c("Female", "Male"))
+merged_CC$RACE_ <- factor(merged_CC$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+
+x <- table1(~ GENDER + RACE_ | DIV , data = merged_CC, overall = F)
+x
+```
+
+Treatment effect with Biased CC and Original CC.
+
+```{r warning=FALSE}
+paste0("TA vs CC ATT is: ", get_ATT(TA, CC))
+paste0("TA vs Biased CC ATT is: ", get_ATT(TA, Biased_CC))
+```
+
+### [Experiment:]{.underline} Match TA and Original CC and check their LDM values against TP
+
+```{r warning=FALSE}
+merged <- rbind(TA %>% select(MASKID:SEATSYS), CC%>% select(MASKID:SEATSYS))
+m.out <- matchit(RANDASSIGN ~ SUB_SENIOR + SUB_CKD + CVDHISTORY + 
+                   RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE + 
+                   CIGSMOKER + CVDPOINTS, data = merged, 
+                   method = "nearest", distance = "glm")
+matched_data <- get_matches(m.out)
+
+TA_LDM <- get_LDM_from_summary(matched_data %>% filter(RANDASSIGN==1)) %>% select(VAR, Level, LDM)
+CC_LDM <- get_LDM_from_summary(matched_data %>% filter(RANDASSIGN==0)) %>% select(VAR, Level, LDM)
+
+merge <- do.call("cbind", list(
+  TA_LDM %>% select(VAR, Level, LDM) %>% rename(LDM_TA = LDM),
+  CC_LDM %>% select(LDM) %>% rename(LDM_CC = LDM)))
+
+SUBGROUP = c("Female", "Male", "Others", "NH Asian", "NH Black", "NH White", "Hispanic")
+merge <- add_column(merge, SUBGROUP, .after = 2)
+
+formattable(merge,
+            align = c("l", "c", "c", "c"))
+```
+
+### [Experiment:]{.underline} Match TA and Biased CC and check their LDM values against TP
+
+```{r warning=FALSE}
+merged <- rbind(TA %>% select(MASKID:SEATSYS), Biased_CC%>% select(MASKID:SEATSYS))
+m.out <- matchit(RANDASSIGN ~ SUB_SENIOR + SUB_CKD + CVDHISTORY + 
+                   RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE + 
+                   CIGSMOKER + CVDPOINTS, data = merged, 
+                   method = "nearest", distance = "glm")
+matched_data <- get_matches(m.out)
+
+TA_LDM <- get_LDM_from_summary(matched_data %>% filter(RANDASSIGN==1)) %>% select(VAR, Level, LDM)
+Biased_CC_LDM <- get_LDM_from_summary(matched_data %>% filter(RANDASSIGN==0)) %>% select(VAR, Level, LDM)
+
+merge <- do.call("cbind", list(
+  TA_LDM %>% select(VAR, Level, LDM) %>% rename(LDM_TA = LDM),
+  Biased_CC_LDM %>% select(LDM) %>% rename(LDM_Biased_CC = LDM)))
+
+SUBGROUP = c("Female", "Male", "Others", "NH Asian", "NH Black", "NH White", "Hispanic")
+merge <- add_column(merge, SUBGROUP, .after = 2)
+
+formattable(merge,
+            align = c("l", "c", "c", "c"))
+```
+
+So as you can see, when we do Propensity Score Matching (without replacement) with TA against Biased_CC, and then compare Matched TA and Biased_CC samples against TP, most of the LDM values both for TA and CC Population is bigger than $\mathcal{T}_{upper}$ in magnitude - resulting in **High Overrepresentation** and **High Underrepresentation**.
+
+## Step 3: Combine EC and CC as HC
+
+Let's add a variable Z, where Z = 1 for all CC and Z = 0 for all EC. Here I'm adding all EC to CC. But there are other ways mentioned in literature in combining EC and CC together and we can think about those here as well.
+
+```{r}
+#drop the DIV column in Biased CC
+drops <- c("DIV")
+Biased_CC <- Biased_CC[, !(names(Biased_CC) %in% drops)]
+
+Biased_CC$Z <- 1 
+EC$Z <- 0
+
+#combine all EC and CC together 
+HC <- rbind(Biased_CC, EC)
+
+```
+
+## Step 4: Calculate On-Trial Score (initial weights) for all HC samples
+
+This will be the initial weight $$W_{HC\_init}$$ for all samples in HC. We'll use this to generate IPF weights so that it matches. This on-trial score is basically the propensity of a control sample to be in the trial. We are to calculate P(Z=1\|X) for all HC samples. Definition of Z is above.
+
+```{r}
+model_ps <- glm(Z ~ SUB_SENIOR + SUB_CKD + 
+             CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+           + CIGSMOKER + CVDPOINTS, family = binomial(), data = HC)
+summary(model_ps)
+```
+
+```{r}
+HC$P_SCORE <- predict(model_ps, type="response")
+
+```
+
+## Step 5: Calculate IPF Weights for HC
+
+```{r}
+#fix the target distributions from TP
+targets <- list()
+# targets$RZ_AGE <- tibble(
+#   '0' = 0.0,
+#   '1' = 0.0,
+#   '2' = 20.7,
+#   '3' = 79.3
+# )
+targets$GENDER <- tibble(
+  '1' = 50.9,
+  '2' = 49.1
+)
+targets$RACE_ <- tibble(
+  '0' = 5.1,
+  '1' = 10.5,
+  '2' = 21.4,
+  '3' = 30.7,
+  '4' = 32.4
+)
+
+#var_list <- c("RZ_AGE", "GENDER", "RACE_")
+var_list <- c("GENDER", "RACE_")
+dat <- HC
+dat$weight <- HC$P_SCORE #setting initial W_HC_init = P_SCORE for all HC samples 
+dat2 <- dat %>% select(unlist(var_list), weight)
+dat2 <- as_tibble(dat2)
+result <- ipu(dat2, targets, max_iterations = 5000)
+W_HC_ipf <- result$weight_tbl$weight
+```
+
+Check if HC samples are now representative of TP. Same as before. Taking a random sample and checking if LDM improved than before.
+
+```{r}
+#check sampled data distribution for equity variables 
+set.seed(42)
+sampled_data <- dat[sample(seq_len(nrow(dat)), replace = TRUE, 3051, prob = W_HC_ipf),]
+drop_column <- c("weight", "Z", "P_SCORE")
+
+HC_copy <- HC %>% select(MASKID:RACE)
+HC_copy$DIV <- 1
+
+sampled_data <- sampled_data[, !(names(sampled_data) %in% drop_column)]
+sampled_data$DIV <- 2
+nhanes_copy <- nhanes
+nhanes_copy$DIV <- 3
+
+merged_HC <- do.call("rbind", list(HC_copy %>% select(RACE_, GENDER, DIV), 
+                                   sampled_data %>% select(RACE_, GENDER, DIV), 
+                                   nhanes_copy %>% select(RACE, GENDER, DIV) %>% 
+                                     rename(RACE_ = RACE)))
+
+merged_HC$DIV <- factor(merged_HC$DIV, levels=1:3, 
+                  labels = c("Original HC", "IPF HC Sample", "NHANES"))
+merged_HC$GENDER <- factor(merged_HC$GENDER, levels=1:2, labels=c("Female", "Male"))
+merged_HC$RACE_ <- factor(merged_HC$RACE_, levels=0:4, labels=c("Others", "NH Asian", "NH Black", "NH White", "Hispanic"))
+
+x <- table1(~ GENDER + RACE_ | DIV , data = merged_HC, overall = F)
+x
+```
+
+## Step 6: Create the Bootstrap samples (n=500) and analyze
+
+Now that we have $$W_{TA\_ipf}$$ and $$W_{HC\_ipf}$$ in our hand, we can go ahead and calculate the treatment effect. One can think of multiple ways to do it -
+
+1.  Weighted Average Treatment effect on the Treated
+
+2.  Use these weights in a Cox Proportional Hazard Model as sampling weights
+
+3.  Take 500 bootstrap samples using these weights and measure treatment effect
+
+We will be experimenting with Method 3 first.
+
+Let's first combine TA and HC along with their IPF weights into one data frame for ease of use.
+
+```{r}
+TA$IPF_W <- W_TA_ipf 
+HC$IPF_W <- W_HC_ipf
+TA_copy <- TA
+TA_copy$Z <- 1
+HC_copy <- HC %>% select(MASKID:RACE, Z, IPF_W)
+study_population <- rbind(TA_copy, HC_copy)
+```
+
+## Bootstrap Samples
+
+Let's start by making 1 bootstrap sample. Each sample will contain samples of original size. Arguably, most common way for bootstrap sampling is to keep sample size to original sample size. But it can be downsized or upsized depending on need/complexity.
+
+```{r}
+#study population
+TA_dat <- study_population %>% filter(RANDASSIGN==1)
+HC_dat <- study_population %>% filter(RANDASSIGN==0)
+
+```
+
+Now let's replicate this example 500 times and get the average estimate.
+
+```{r}
+ATT_list <- list()
+for (i in 1:500){
+  set.seed(i)
+  TA_sample <- TA_dat[sample(seq_len(nrow(TA_dat)), replace = TRUE, 1975, 
+                             prob = TA_dat$IPF_W),]
+  HC_sample <- HC_dat[sample(seq_len(nrow(HC_dat)), replace = TRUE, 3051, 
+                             prob = HC_dat$IPF_W),]
+  
+  merged_sample <- rbind(TA_sample, HC_sample)
+  m.out <- matchit(RANDASSIGN ~ SUB_SENIOR + SUB_CKD + 
+             CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+           + CIGSMOKER + CVDPOINTS, data = merged_sample, 
+                    method = "nearest", distance = "glm")
+  matched_data <- match.data(m.out) 
+  fit <- lm(SEATSYS ~ RANDASSIGN + SUB_SENIOR + SUB_CKD + 
+               CVDHISTORY + RZ_AGE + GENDER + RACE_ + SERUMCREAT + GFRESTIMATE
+             + CIGSMOKER + CVDPOINTS, data = matched_data, weights = weights)
+  ATT <- coeftest(fit, vcov. = vcovCL, cluster = ~subclass)["RANDASSIGN",,drop = FALSE][1]
+  ATT_list <- c(ATT_list, ATT)
+}
+```
+
+Average Treatment effect with variance
+
+```{r}
+cat(paste0("Estimated Mean is ",mean(unlist(ATT_list)), "\n", 
+           "Variance is ", var(unlist(ATT_list)), "\n", 
+           "Standard Deviation is ", sd(unlist(ATT_list))))
+
+```
+
+Now finally, let's make a nice comparative chart among the ATT values from TA:CC, TA:BiasedCC, TA:HC, and estimated ATTs from the bootstrap samples.
+
+```{r warning=FALSE}
+
+TACC <- round(get_ATT(TA, CC), digits=3)
+TABCC <- round(get_ATT(TA, Biased_CC), digits=3)
+TAHC <- round(get_ATT(TA, HC), digits=3)
+TAHC_ipf_mean <- round(mean(unlist(ATT_list)), digits = 3) 
+TAHC_ipf_std <- round(sd(unlist(ATT_list)), digits=3)
+
+D <- data.frame(Population= c("TA vs CC", "TA vs Biased CC", "TA vs HC", "TA vs HC with IPF (mean +/- std)"),
+                Values = c(as.character(TACC), as.character(TABCC), as.character(TAHC), 
+                          paste(as.character(TAHC_ipf_mean),"+/-",as.character(TAHC_ipf_std))  ))
+D
+
+```
+
+How the equity looks for one bootstrap sample of TA and HC, sampled using IPF weights -
+
+```{r}
+TA_sample <- TA_dat[sample(seq_len(nrow(TA_dat)), replace = TRUE, 1975, 
+                             prob = TA_dat$IPF_W),]
+HC_sample <- HC_dat[sample(seq_len(nrow(HC_dat)), replace = TRUE, 3051, 
+                             prob = HC_dat$IPF_W),]
+
+TA_sample_LDM <- get_LDM_from_summary(TA_sample) %>% select(VAR, Level, LDM) %>% rename(LDM_TA_IPF = LDM)
+HC_sample_LDM <- get_LDM_from_summary(HC_sample) %>% select(LDM) %>% rename(LDM_HC_IPF = LDM)
+
+SUBGROUP = c("Female", "Male", "Others", "NH Asian", "NH Black", "NH White", "Hispanic")
+merged_LDM_IPF <- cbind(TA_sample_LDM, HC_sample_LDM)
+merge_LDM_IPF <- add_column(merged_LDM_IPF, SUBGROUP, .after = 2)
+
+formattable(merge_LDM_IPF,
+            align = c("l", "c", "c", "c"))
+
+```
+
+As you can see, equity is preserved in both TA and HC samples when compared against TP. I ran this multiple times as TA and HC both are random samples. I'll report the Mean +/- Std of LDM for each covariate next week for 500 bootstrap samples.
+
+Final Report: LDM Comparisons of all Populations
+
+```{r}
+final_LDM_report <- do.call("cbind", 
+        list(
+          merged_LDM_original %>% select(VAR, SUBGROUP, LDM_TA, LDM_CC, LDM_EC),
+          get_LDM_from_summary(HC) %>% select(LDM) %>% rename(LDM_HC = LDM),
+          get_LDM_from_summary(Biased_CC) %>% select(LDM) %>% rename(LDM_BCC = LDM),
+          merged_LDM_IPF %>% select(LDM_TA_IPF, LDM_HC_IPF)))
+
+```
+
+```{r}
+customGreen = "#71CA97"
+customRedNeg = "#ff7f7f"
+customRedPos = '#CC5500'
+customYellowNeg = '#FDDA0D'
+customYellowPos = '#FFBF00'
+
+datatable(final_LDM_report, options = list(scrollX = T)) %>% 
+  formatStyle(c('LDM_TA', "LDM_CC", "LDM_EC", "LDM_HC", "LDM_BCC", "LDM_TA_IPF", "LDM_HC_IPF"),
+              backgroundColor = styleInterval(c(-0.51, -0.22, 0.22, 0.51), 
+                                              c(customRedNeg, customYellowNeg, customGreen,
+                                                customYellowPos, customRedPos))) %>%
+  formatRound(c('LDM_TA', "LDM_CC", "LDM_EC", "LDM_HC", "LDM_BCC", "LDM_TA_IPF", "LDM_HC_IPF"), digits = 3)
+```
